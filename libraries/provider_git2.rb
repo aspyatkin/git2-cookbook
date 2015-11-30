@@ -21,9 +21,11 @@ class Chef
       def load_current_resource
         @current_resource ||= Chef::Resource::Git2.new(new_resource.name)
         metadata = find_current_metadata
+
         if metadata.has_key? :branch
           @current_resource.branch metadata[:branch]
         end
+
         if metadata.has_key? :url
           @current_resource.url metadata[:url]
         end
@@ -51,19 +53,44 @@ class Chef
         requirements.assert(:create) do |a|
           if @current_resource.url
             a.assertion { @current_resource.url == @new_resource.url }
-            a.whyrun("Git repository at #{new_resource.target} has different origin url. Assuming it would have match the specified value.")
+            a.whyrun("Git repository at #{new_resource.target} has different origin url. Assuming it would have matched the specified value.")
             a.failure_message(Chef::Exceptions::Git2RuntimeError,
-              "Cannot clone #{@new_resource} to #{@new_resource.target}, resource has already been provisioned")
+              "Cannot clone #{@new_resource} to #{@new_resource.target}, another git repository is already located here")
           end
+        end
+
+        requirements.assert(:create) do |a|
+          a.assertion { branch_exists? }
+          a.whyrun("Git remote reference should be present. Assuming it would have been created.")
+          a.failure_message(Chef::Exceptions::Git2RuntimeError,
+            "Cannot checkout #{@new_resource} to #{@new_resource.target}, remote reference #{@new_resource.branch} does not exist")
         end
       end
 
       def action_create
         if target_dir_non_existent_or_empty?
-          clone
+          git_clone
         else
+          git_fetch
           if @current_resource.branch != @new_resource.branch
-            checkout
+            if repository_dirty?
+              raise Chef::Exceptions::Git2RuntimeError, "Repository #{@new_resource} is dirty"
+            else
+              commits_ahead = get_commits_ahead
+              if commits_ahead > 0
+                raise Chef::Exceptions::Git2RuntimeError, "Local branch #{@new_resource.branch} of #{@new_resource} is #{commits_ahead} commit(s) ahead remote. Please push your changes"
+              else
+                git_checkout
+              end
+            end
+          else
+            unless repository_dirty?
+              commits_ahead = get_commits_ahead
+              commits_behind = get_commits_behind
+              if commits_ahead == 0 and commits_behind > 0
+                git_pull
+              end
+            end
           end
         end
       end
@@ -107,26 +134,74 @@ class Chef
         run_opts
       end
 
-      def clone
+      def git_clone
         converge_by("clone from #{@new_resource.url} into #{@new_resource.target}") do
-          remote = 'origin'
 
           args = []
-          args << "-o #{remote}" unless remote == 'origin'
           args << "-b #{@new_resource.branch}" unless @new_resource.branch == 'master'
 
           Chef::Log.info "#{@new_resource} cloning repo #{@new_resource.url} to #{@new_resource.target}"
 
-          clone_cmd = "git clone #{args.join(' ')} \"#{@new_resource.url}\" \"#{@new_resource.target}\""
-          shell_out!(clone_cmd, run_options)
+          command = %Q(git clone #{args.join(' ')} "#{@new_resource.url}" "#{@new_resource.target}")
+          shell_out!(command, run_options)
         end
       end
 
-      def checkout
+      def git_fetch
+        command = 'git fetch --all'
+        shell_out!(command, run_options(cwd: @new_resource.target))
+      end
+
+      def git_checkout
         converge_by("checkout branch #{@new_resource.branch} on #{@new_resource.url} into #{@new_resource.target}") do
           checkout_cmd = "git checkout #{@new_resource.branch}"
           shell_out!(checkout_cmd, run_options(cwd: @new_resource.target))
         end
+      end
+
+      def git_pull
+        converge_by("pull #{@new_resource.url} to #{@new_resource.target}") do
+          pull_cmd = "git pull --rebase"
+          shell_out!(pull_cmd, run_options(cwd: @new_resource.target))
+        end
+      end
+
+      def branch_exists?
+        Chef::Log.debug("#{@new_resource} resolving remote reference")
+        ls_remote_command = %Q(git ls-remote "#{@new_resource.url}" "#{new_resource.branch}*")
+        @resolved_reference = shell_out!(ls_remote_command, run_options).stdout
+        refs = @resolved_reference.split("\n").map { |line| line.split("\t") }
+        return refs.size > 0
+      end
+
+      def local_branch
+        command = 'git rev-parse --abbrev-ref HEAD'
+        shell_out!(command, run_options(cwd: cwd)).stdout.strip
+      end
+
+      def remote_branch
+        command = 'git rev-parse --abbrev-ref --symbolic-full-name @{u}'
+        shell_out!(command, run_options(cwd: cwd)).stdout.strip
+      end
+
+      def repository_dirty?
+        command = 'git status --porcelain'
+        output = shell_out!(command, run_options(cwd: cwd)).stdout
+        return output != ''
+      end
+
+      def get_local_remote_diff_count
+        command = "git rev-list --left-right --count #{local_branch}...#{remote_branch}"
+        output = shell_out!(command, run_options(cwd:cwd)).stdout.strip
+        output.split("\t")
+      end
+
+      def get_commits_ahead
+        get_local_remote_diff_count[0].to_i
+      end
+
+      def get_commits_behind
+        get_local_remote_diff_count[1].to_i
       end
     end
   end
