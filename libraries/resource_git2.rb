@@ -15,6 +15,8 @@ class Chef
         @target = name
         @user = 'root'
         @group = 'root'
+        @ssh_wrapper = nil
+        @timeout = 600
       end
 
       def url(arg=nil)
@@ -35,6 +37,14 @@ class Chef
 
       def group(arg=nil)
         set_or_return(:group, arg, :kind_of => String)
+      end
+
+      def ssh_wrapper(arg=nil)
+        set_or_return(:ssh_wrapper, arg, :kind_of => String)
+      end
+
+      def timeout(arg=nil)
+        set_or_return(:timeout, arg, :kind_of => Integer)
       end
     end
   end
